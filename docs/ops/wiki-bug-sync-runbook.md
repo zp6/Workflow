@@ -19,8 +19,10 @@ of the community change loop.
 3. BUG lane: filters promoted BUG entries with `bug_number > cursor`.
 4. Community lane: filters promoted non-bug request artifacts not in
    `.agents/.wiki_change_sync_seen.json`.
-5. For each new item, calls `wiki action=read` to pull frontmatter, then POSTs
-   a GH Issue via `GITHUB_TOKEN`.
+5. For each new item, calls `wiki action=read` to pull frontmatter. Non-bug
+   community request issues also include a bounded copy of the source wiki body
+   so auto-change writers see the request evidence without a separate lookup.
+   Then the sync POSTs a GH Issue via `GITHUB_TOKEN`.
 6. BUG issue title: `[BUG-NNN] <title>`. Labels: `daemon-request`,
    `auto-change`, `auto-bug`, `request:bug`, `payment:free-ok`,
    `writer-pool:claude-codex`, `checker:cross-family`, `gate-required`, and

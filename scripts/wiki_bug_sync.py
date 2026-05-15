@@ -48,6 +48,7 @@ DEFAULT_URL = "https://tinyassets.io/mcp"
 DEFAULT_TIMEOUT = 20.0
 GITHUB_API = "https://api.github.com"
 GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY", "Jonnyton/Workflow")
+MAX_CHANGE_BODY_CHARS = 12000
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 CURSOR_PATH = _REPO_ROOT / ".agents" / ".wiki_bug_sync_cursor"
@@ -436,14 +437,28 @@ def list_new_change_requests(
 # ---------------------------------------------------------------------------
 
 
-def fetch_bug_detail(
+def _split_frontmatter(content: str) -> tuple[dict[str, str], str]:
+    meta: dict[str, str] = {}
+    body = content
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            for line in parts[1].splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    meta[k.strip()] = v.strip()
+            body = parts[2].lstrip()
+    return meta, body
+
+
+def fetch_wiki_page_detail(
     url: str,
     sid: str | None,
     path: str,
     timeout: float,
     post_fn=None,
 ) -> dict[str, Any]:
-    """Call wiki action=read and parse the frontmatter fields we need."""
+    """Call wiki action=read and return parsed frontmatter plus page body."""
     page = Path(path).stem or path
     result = _mcp_call_tool(
         url, sid, "wiki", {"action": "read", "page": page}, timeout, post_fn
@@ -455,16 +470,35 @@ def fetch_bug_detail(
     except (json.JSONDecodeError, AttributeError):
         content = text
 
-    # Parse frontmatter from the markdown content
-    meta: dict[str, str] = {}
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            for line in parts[1].splitlines():
-                if ":" in line:
-                    k, _, v = line.partition(":")
-                    meta[k.strip()] = v.strip()
-    return meta
+    meta, body = _split_frontmatter(content)
+    return {"meta": meta, "body": body, "content": content}
+
+
+def fetch_bug_detail(
+    url: str,
+    sid: str | None,
+    path: str,
+    timeout: float,
+    post_fn=None,
+) -> dict[str, Any]:
+    """Call wiki action=read and parse the frontmatter fields we need."""
+    return fetch_wiki_page_detail(url, sid, path, timeout, post_fn).get("meta", {})
+
+
+def format_change_issue_body(entry: dict[str, Any], page_detail: dict[str, Any]) -> str:
+    """Build bounded issue context for non-bug community request artifacts."""
+    body = f"**Wiki type:** `{entry.get('type', 'unknown')}`"
+    source_body = str(page_detail.get("body") or "").strip()
+    if not source_body:
+        return body
+
+    truncated = source_body[:MAX_CHANGE_BODY_CHARS]
+    if len(source_body) > MAX_CHANGE_BODY_CHARS:
+        truncated = (
+            f"{truncated}\n\n"
+            f"_Source wiki body truncated at {MAX_CHANGE_BODY_CHARS} characters._"
+        )
+    return f"{body}\n\n## Source wiki body\n\n{truncated}"
 
 
 # ---------------------------------------------------------------------------
@@ -769,12 +803,14 @@ def sync(
             request_kind = entry["request_kind"]
 
             try:
-                meta = fetch_bug_detail(url, sid, path, timeout, post_fn)
+                page_detail = fetch_wiki_page_detail(url, sid, path, timeout, post_fn)
+                meta = page_detail.get("meta", {})
             except SyncError:
+                page_detail = {}
                 meta = {}
 
             title = meta.get("title") or entry.get("title") or Path(path).stem
-            body_md = f"**Wiki type:** `{entry.get('type', 'unknown')}`"
+            body_md = format_change_issue_body(entry, page_detail)
             issue_url = create_gh_change_issue(
                 _token,
                 repo,

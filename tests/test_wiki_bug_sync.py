@@ -16,6 +16,8 @@ from wiki_bug_sync import (  # noqa: E402
     create_gh_change_issue,
     create_gh_issue,
     fetch_bug_detail,
+    fetch_wiki_page_detail,
+    format_change_issue_body,
     list_new_bugs,
     list_new_change_requests,
     priority_labels_for_request,
@@ -49,16 +51,28 @@ def _wiki_list_resp(bugs: list[dict]) -> dict:
     }
 
 
-def _wiki_read_resp(meta: dict) -> dict:
+def _wiki_read_resp(meta: dict, body: str = "# Body") -> dict:
     """Build a mock MCP tools/call result for wiki action=read."""
     fm_lines = "\n".join(f"{k}: {v}" for k, v in meta.items())
-    content = f"---\n{fm_lines}\n---\n\n# Body"
+    content = f"---\n{fm_lines}\n---\n\n{body}"
     return {
         "jsonrpc": "2.0",
         "id": 10,
         "result": {
             "content": [
                 {"type": "text", "text": json.dumps({"content": content})}
+            ]
+        },
+    }
+
+
+def _wiki_list_promoted_resp(promoted: list[dict]) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "result": {
+            "content": [
+                {"type": "text", "text": json.dumps({"promoted": promoted, "drafts": []})}
             ]
         },
     }
@@ -433,6 +447,36 @@ def test_fetch_bug_detail_reads_with_page_not_path():
     assert detail["title"] == "Bug"
 
 
+def test_fetch_wiki_page_detail_returns_body_without_frontmatter():
+    detail = fetch_wiki_page_detail(
+        "http://fake/mcp",
+        "sid1",
+        "pages/plans/user-buildable-community-change-loop-v0-substrate-readiness-baseline.md",
+        5.0,
+        post_fn=CapturingPost([
+            (_wiki_read_resp(
+                {"title": "User-Buildable Community Change Loop"},
+                "## Main finding\n\nInput-aware loops are gated on BUG-083.",
+            ), "sid1"),
+        ]),
+    )
+
+    assert detail["meta"]["title"] == "User-Buildable Community Change Loop"
+    assert "Input-aware loops are gated on BUG-083." in detail["body"]
+    assert "title:" not in detail["body"]
+
+
+def test_format_change_issue_body_includes_bounded_source_context():
+    body = format_change_issue_body(
+        {"type": "plan"},
+        {"body": "## Pickup hints\n\nRetest immediately after BUG-083 changes."},
+    )
+
+    assert "**Wiki type:** `plan`" in body
+    assert "## Source wiki body" in body
+    assert "Retest immediately after BUG-083 changes." in body
+
+
 # ---------------------------------------------------------------------------
 # sync() — happy path: no new bugs
 # ---------------------------------------------------------------------------
@@ -523,6 +567,67 @@ def test_sync_one_new_bug_updates_cursor(tmp_path):
     assert rc == 0
     assert created_issues == ["BUG-003"]
     assert read_cursor(cursor_path) == 3
+
+
+def test_sync_change_request_includes_source_wiki_body(tmp_path):
+    cursor_path = tmp_path / "cursor"
+    change_seen_path = tmp_path / "seen.json"
+    write_cursor(0, cursor_path)
+
+    path = "pages/plans/user-buildable-community-change-loop-v0-substrate-readiness-baseline.md"
+    captured = {}
+
+    post_fn = _make_post_fn(
+        (_INIT_OK, "sid1"),
+        (_NOTIF_NONE, "sid1"),
+        (_wiki_list_promoted_resp([
+            {
+                "path": path,
+                "title": "User-Buildable Community Change Loop",
+                "type": "plan",
+            }
+        ]), "sid1"),
+        (_wiki_read_resp(
+            {"title": "User-Buildable Community Change Loop"},
+            (
+                "## Main finding\n\n"
+                "Input-aware community loops are gated on BUG-083.\n\n"
+                "## Pickup hints\n\n"
+                "Retest immediately after BUG-083 changes."
+            ),
+        ), "sid1"),
+    )
+
+    def _fake_create_change_issue(
+        token, repo, request_kind, title, path, body_md,
+        dry_run=False, gh_api=None, timeout=20.0,
+    ):
+        captured.update(
+            request_kind=request_kind,
+            title=title,
+            path=path,
+            body_md=body_md,
+        )
+        return "https://github.com/owner/repo/issues/869"
+
+    with patch("wiki_bug_sync.create_gh_change_issue", side_effect=_fake_create_change_issue):
+        rc = sync(
+            "http://fake/mcp",
+            5.0,
+            dry_run=False,
+            include_community_requests=True,
+            token="fake-token",
+            cursor_path=cursor_path,
+            change_seen_path=change_seen_path,
+            post_fn=post_fn,
+        )
+
+    assert rc == 0
+    assert captured["request_kind"] == "project-design"
+    assert captured["path"] == path
+    assert "Input-aware community loops are gated on BUG-083." in captured["body_md"]
+    assert "Retest immediately after BUG-083 changes." in captured["body_md"]
+    assert path in change_seen_path.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
